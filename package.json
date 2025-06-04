@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "chart.js": "^4.4.9",
+    "csv-parse": "^5.6.0",
+    "react-chartjs-2": "^5.3.0"
+  }
+}

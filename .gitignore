@@ -1,0 +1,29 @@
+# Node modules
+node_modules/
+
+# Environment files
+.env
+.env.*
+
+# Runtime cache files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.cache/
+dist/
+tmp/
+temp/
+build/
+.DS_Store
+.idea/
+.vscode/
+# Meta files
+*.meta
+*.lock
+*.swp
+*.swo
+*.bak
+*.orig
+*.tmp
