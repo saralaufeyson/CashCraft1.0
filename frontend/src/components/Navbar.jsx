@@ -40,7 +40,7 @@ const Navbar = () => {
             alignItems: 'center'
           }}
         >
-          Budget Tracker
+          CashCraft
         </Typography>
         <Box sx={{ display: 'flex', gap: 1 }}>
           <Button

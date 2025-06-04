@@ -72,6 +72,10 @@ ChartJS.register(
   Legend
 );
 
+const CATEGORY_OPTIONS = [
+  'Food', 'Transport', 'Shopping', 'Bills', 'Salary', 'Transfer', 'Other'
+];
+
 const Transactions = () => {
   const [transactions, setTransactions] = useState([]);
   const [jars, setJars] = useState([]);
@@ -106,6 +110,10 @@ const Transactions = () => {
   });
   const [pdfCsv, setPdfCsv] = useState("");
   const [pdfTransactions, setPdfTransactions] = useState([]);
+  const [pdfPending, setPdfPending] = useState([]); // for unconfirmed
+  const [pdfConfirmed, setPdfConfirmed] = useState([]); // for confirmed
+  const [pdfCategoryMap, setPdfCategoryMap] = useState({});
+
   const theme = useTheme();
   const isMobile = useMediaQuery(theme.breakpoints.down('sm'));
 
@@ -339,6 +347,151 @@ const Transactions = () => {
     return matchesSearch && matchesType && matchesJar && matchesAmount;
   });
 
+  const handlePdfUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    try {
+      const formData = new FormData();
+      formData.append('pdf', file);
+      const token = localStorage.getItem('token');
+      const response = await axios.post('/api/transactions/upload-pdf', formData, {
+        headers: {
+          'Content-Type': 'multipart/form-data',
+          Authorization: `Bearer ${token}`
+        }
+      });
+      // Use only JSON data
+      setPdfTransactions(response.data.transactions || []);
+      // Reset pending/confirmed/category
+      setPdfPending(response.data.transactions || []);
+      setPdfConfirmed([]);
+      setPdfCategoryMap({});
+    } catch (error) {
+      console.error('PDF upload error:', error);
+    }
+  };
+
+  // Helpers for PDF table
+  function looksLikeDate(val) {
+    if (!val || typeof val !== 'string') return false;
+    return /^\d{4}-\d{2}-\d{2}$/.test(val) || /^\d{2}\/\d{2}\/\d{4}$/.test(val) || /^\d{2}-\d{2}-\d{4}$/.test(val);
+  }
+  function getFieldKey(obj, possibleNames) {
+    const keys = Object.keys(obj);
+    for (const name of possibleNames) {
+      const key = keys.find(k => k.toLowerCase().replace(/\s/g, '').includes(name));
+      if (key) return key;
+    }
+    return null;
+  }
+  // Prepare rows for display (robust for various bank formats)
+  const pdfRows = pdfPending
+    .map((tx, idx) => {
+      // Date keys
+      const dateKey = getFieldKey(tx, [
+        'trandate', 'date', 'transactiondate', 'valuedate'
+      ]);
+      // Particulars keys
+      const particularsKey = getFieldKey(tx, [
+        'particular', 'desc', 'narration', 'details', 'remark', 'remarks', 'info', 'description', 'transactiondetails', 'transaction detail'
+      ]);
+      // Credit keys
+      const creditKey = getFieldKey(tx, [
+        'credit', 'cr', 'deposit', 'deposited', 'depositamt', 'deposit amount', 'depositamt', 'depositamount'
+      ]);
+      // Debit keys
+      const debitKey = getFieldKey(tx, [
+        'debit', 'dr', 'withdrawal', 'withdrawn', 'withdrawalamt', 'withdrawal amount', 'withdrawalamt', 'withdrawalamount'
+      ]);
+
+      const date = dateKey ? tx[dateKey] : '';
+      // Fallback: if particularsKey not found, use the first non-date, non-credit, non-debit field
+      let particulars = '';
+      if (particularsKey) {
+        particulars = tx[particularsKey];
+      } else {
+        const skipKeys = [dateKey, creditKey, debitKey].filter(Boolean);
+        const firstOtherKey = Object.keys(tx).find(
+          k => !skipKeys.includes(k)
+        );
+        particulars = firstOtherKey ? tx[firstOtherKey] : '';
+      }
+
+      // Parse credit and debit as floats, treat empty/NaN as 0
+      const creditRaw = creditKey ? tx[creditKey] : '';
+      const debitRaw = debitKey ? tx[debitKey] : '';
+      // Remove commas and parse
+      const credit = parseFloat((creditRaw || '').toString().replace(/,/g, '')) || 0;
+      const debit = parseFloat((debitRaw || '').toString().replace(/,/g, '')) || 0;
+
+      let type = '';
+      let amount = '';
+      // Only one of credit or debit should be non-zero per row
+      if (credit > 0 && debit === 0) {
+        type = 'Credit';
+        amount = credit;
+      } else if (debit > 0 && credit === 0) {
+        type = 'Debit';
+        amount = debit;
+      } else if (credit > 0 && debit > 0) {
+        // If both are present, prefer the larger one or mark as ambiguous
+        if (credit >= debit) {
+          type = 'Credit';
+          amount = credit;
+        } else {
+          type = 'Debit';
+          amount = debit;
+        }
+      } else if (credit > 0) {
+        type = 'Credit';
+        amount = credit;
+      } else if (debit > 0) {
+        type = 'Debit';
+        amount = debit;
+      } else {
+        // If both are zero, skip this row
+        return null;
+      }
+
+      if (looksLikeDate(date) && particulars && amount) {
+        return {
+          _rowId: idx,
+          date,
+          particulars,
+          amount,
+          type,
+          raw: tx
+        };
+      }
+      return null;
+    })
+    .filter(Boolean);
+
+  const handlePdfCategoryChange = (rowId, value) => {
+    setPdfCategoryMap({ ...pdfCategoryMap, [rowId]: value });
+  };
+
+  const handlePdfConfirm = (row) => {
+    setPdfConfirmed([
+      ...pdfConfirmed,
+      {
+        ...row,
+        category: pdfCategoryMap[row._rowId] || 'Other'
+      }
+    ]);
+    setPdfPending(pdfPending.filter((_, idx) => idx !== row._rowId));
+    const newCatMap = { ...pdfCategoryMap };
+    delete newCatMap[row._rowId];
+    setPdfCategoryMap(newCatMap);
+  };
+
+  const handlePdfReject = (row) => {
+    setPdfPending(pdfPending.filter((_, idx) => idx !== row._rowId));
+    const newCatMap = { ...pdfCategoryMap };
+    delete newCatMap[row._rowId];
+    setPdfCategoryMap(newCatMap);
+  };
+
   return (
     <Container>
       <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
@@ -504,14 +657,98 @@ const Transactions = () => {
         </TextField>
       </FormDialog>
 
-      {pdfCsv && (
+      {/* PDF Transactions Table */}
+      {pdfRows.length > 0 && (
         <Box mt={3}>
-          <Typography variant="h6">Extracted CSV</Typography>
-          <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-            {pdfCsv}
+          <Typography variant="h6">Parsed PDF Transactions</Typography>
+          <Paper>
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell>Transaction Date</TableCell>
+                  <TableCell>Credit/Debit</TableCell>
+                  <TableCell>Particulars</TableCell>
+                  <TableCell>Amount</TableCell>
+                  <TableCell>Category</TableCell>
+                  <TableCell>Action</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {pdfRows.map(row => (
+                  <TableRow key={row._rowId}>
+                    <TableCell>{row.date}</TableCell>
+                    <TableCell>{row.type}</TableCell>
+                    <TableCell>{row.particulars}</TableCell>
+                    <TableCell>{row.amount}</TableCell>
+                    <TableCell>
+                      <Select
+                        size="small"
+                        value={pdfCategoryMap[row._rowId] || ''}
+                        onChange={e => handlePdfCategoryChange(row._rowId, e.target.value)}
+                        displayEmpty
+                      >
+                        <MenuItem value="">Select</MenuItem>
+                        {CATEGORY_OPTIONS.map(opt => (
+                          <MenuItem key={opt} value={opt}>{opt}</MenuItem>
+                        ))}
+                      </Select>
+                    </TableCell>
+                    <TableCell>
+                      <Button
+                        variant="contained"
+                        size="small"
+                        color="success"
+                        disabled={!pdfCategoryMap[row._rowId]}
+                        onClick={() => handlePdfConfirm(row)}
+                        sx={{ mr: 1 }}
+                      >
+                        Yes
+                      </Button>
+                      <Button
+                        variant="outlined"
+                        size="small"
+                        color="error"
+                        onClick={() => handlePdfReject(row)}
+                      >
+                        No
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
           </Paper>
-          <Typography variant="h6">Parsed Transactions</Typography>
-          <CsvTable data={pdfTransactions} />
+        </Box>
+      )}
+
+      {/* Optionally, show confirmed PDF transactions */}
+      {pdfConfirmed.length > 0 && (
+        <Box mt={3}>
+          <Typography variant="h6">Confirmed PDF Transactions</Typography>
+          <Paper>
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell>Transaction Date</TableCell>
+                  <TableCell>Credit/Debit</TableCell>
+                  <TableCell>Particulars</TableCell>
+                  <TableCell>Amount</TableCell>
+                  <TableCell>Category</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {pdfConfirmed.map((row, idx) => (
+                  <TableRow key={idx}>
+                    <TableCell>{row.date}</TableCell>
+                    <TableCell>{row.type}</TableCell>
+                    <TableCell>{row.particulars}</TableCell>
+                    <TableCell>{row.amount}</TableCell>
+                    <TableCell>{row.category}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </Paper>
         </Box>
       )}
     </Container>
@@ -519,1579 +756,3 @@ const Transactions = () => {
 };
 
 export default Transactions;
-
-
-const [pdfCsv, setPdfCsv] = useState("");
-const [pdfTransactions, setPdfTransactions] = useState([]);
-const handlePdfUpload = async (event) => {
-  const file = event.target.files[0];
-  if (!file) return;
-  try {
-    const formData = new FormData();
-    formData.append('pdf', file);
-    const token = localStorage.getItem('token');
-    const response = await axios.post('/api/transactions/upload-pdf', formData, {
-      headers: {
-        'Content-Type': 'multipart/form-data',
-        Authorization: `Bearer ${token}`
-      }
-    });
-    setPdfCsv(response.data.csv || "");
-    setPdfTransactions(response.data.transactions || []);
-  } catch (error) {
-    console.error('PDF upload error:', error);
-  }
-};
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {pdfTransactions.map((row, idx) => (
-            <TableRow key={idx}>
-              {Object.values(row).map((cell, i) => (
-                <TableCell key={i}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  </Box>
-)}
-{pdfCsv && (
-  <Box mt={3}>
-    <Typography variant="h6">Extracted CSV</Typography>
-    <Paper sx={{ p: 2, mb: 2, whiteSpace: 'pre', overflowX: 'auto' }}>
-      {pdfCsv}
-    </Paper>
-    <Typography variant="h6">Parsed Transactions</Typography>
-    <TableContainer component={Paper} sx={{ mb: 2 }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            {pdfTransactions[0] && Object.keys(pdfTransactions[0]).map((header) => (
-              <TableCell key={header}>{header}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
